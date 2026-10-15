@@ -94,6 +94,11 @@ class LocalFineTuneHandler:
             do_sample=self.config.get('do_sample'),
         )
         self.local_model = HuggingFacePipeline(pipeline=self.local_model_pipeline)
+        self.retry_parser = RetryOutputParser.from_llm(
+            llm=self.local_model,
+            parser=self.parser,
+            max_retries=self.MAX_RETRIES,
+        )
 
     def call_llm_local_custom_fine_tune(self, OCR_text, json_report, paths):
         json_file_path_wiki, txt_file_path_ind_prompt = paths[-2:]

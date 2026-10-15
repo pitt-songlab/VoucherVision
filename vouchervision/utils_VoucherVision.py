@@ -85,6 +85,7 @@ def process_single_image_worker(job_args):
 
     # --- 3. Call LLM (if OCR succeeded) ---
     response_candidate = None
+    response_candidate_sanitized = None
     nt_in, nt_out, thinking_tokens = 0, 0, 0
     WFO_record, GEO_record, usage_report = None, None, None
     llm_failed = False
@@ -100,6 +101,11 @@ def process_single_image_worker(job_args):
                 response_candidate, nt_in, nt_out, WFO_record, GEO_record, usage_report = llm_model.call_llm_api_GooglePalm2(prompt, None, paths)
             elif 'GEMINI' in name_parts:
                 response_candidate, nt_in, nt_out, WFO_record, GEO_record, usage_report, thinking_tokens, _thinking_budget_requested = llm_model.call_llm_api_GoogleGemini(prompt, None, paths)
+            elif 'LOCAL' in name_parts and 'MISTRAL' in name_parts:
+                if 'CPU' in name_parts:
+                    response_candidate, nt_in, nt_out, WFO_record, GEO_record, usage_report = llm_model.call_llm_local_cpu_MistralAI(prompt, None, paths)
+                else:
+                    response_candidate, nt_in, nt_out, WFO_record, GEO_record, usage_report = llm_model.call_llm_local_MistralAI(prompt, None, paths)
             elif 'MISTRAL' in name_parts and ('LOCAL' not in name_parts):
                 response_candidate, nt_in, nt_out, WFO_record, GEO_record, usage_report = llm_model.call_llm_api_MistralAI(prompt, None, paths)
             elif 'Hyperbolic' in name_parts:
@@ -1877,9 +1883,12 @@ class VoucherVision():
             jobs.append(job_args)
 
         # --- Execute Jobs in Parallel ---
+        # Local Qwen + local Mistral both reserve large GPU blocks during load.
+        # Keeping a single worker avoids competing model loads and prevents the OOMs
+        # seen when both models are instantiated in the same process.
         all_results = [None] * len(self.img_paths)
-        num_workers = min(16, len(valid_img_paths))
-        self.logger.info(f"Starting {num_workers} worker threads for {len(jobs)} images.")
+        num_workers = 1
+        self.logger.info(f"Starting {num_workers} worker thread for {len(jobs)} images to protect GPU memory.")
 
         with concurrent.futures.ThreadPoolExecutor(max_workers=num_workers) as executor:
             # Use a progress bar

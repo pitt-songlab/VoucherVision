@@ -186,41 +186,58 @@ class APIvalidation:
     def check_google_vision_client(self):
         results = {"ocr_print": False, "ocr_hand": False}
 
-        if self.is_hf:
-            client_beta = vision_beta.ImageAnnotatorClient(credentials=self.get_google_credentials())
-            client = vision.ImageAnnotatorClient(credentials=self.get_google_credentials())
-        else:
-            client_beta = vision_beta.ImageAnnotatorClient(credentials=self.get_google_credentials()) 
-            client = vision.ImageAnnotatorClient(credentials=self.get_google_credentials())
-        
+        image_candidates = [
+            os.path.join(self.dir_home, 'demo', 'ocr_test', 'ocr_test.jpg'),
+            os.path.join(os.getcwd(), 'demo', 'ocr_test', 'ocr_test.jpg'),
+            os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..', 'demo', 'ocr_test', 'ocr_test.jpg')),
+        ]
+
+        content = None
+        for image_path in image_candidates:
+            try:
+                with open(image_path, "rb") as image_file:
+                    content = image_file.read()
+                    break
+            except FileNotFoundError:
+                continue
+            except Exception:
+                continue
+
+        if content is None:
+            print(f"Google Vision demo image not found in any expected location: {image_candidates}")
+            return results
+
         try:
-            with open(os.path.join(self.dir_home,'demo', 'ocr_test', 'ocr_test.jpg'), "rb") as image_file:
-                content = image_file.read()
-        except:
-            with open("./demo/ocr_test/ocr_test.jpg", "rb") as image_file:
-                content = image_file.read()
+            if self.is_hf:
+                client_beta = vision_beta.ImageAnnotatorClient(credentials=self.get_google_credentials())
+                client = vision.ImageAnnotatorClient(credentials=self.get_google_credentials())
+            else:
+                client_beta = vision_beta.ImageAnnotatorClient(credentials=self.get_google_credentials())
+                client = vision.ImageAnnotatorClient(credentials=self.get_google_credentials())
+        except Exception:
+            return results
 
         try:
             image = vision_beta.Image(content=content)
             image_context = vision_beta.ImageContext(language_hints=["en-t-i0-handwrit"])
             response = client_beta.document_text_detection(image=image, image_context=image_context)
             texts = response.text_annotations
-            
+
             print(f"OCR Hand:\n{texts[0].description}")
             if len(texts[0].description) > 0:
                 results['ocr_hand'] = True
-        except:
+        except Exception:
             pass
 
         try:
             image = vision.Image(content=content)
             response = client.document_text_detection(image=image)
             texts = response.text_annotations
-        
+
             print(f"OCR Print:\n{texts[0].description}")
             if len(texts[0].description) > 0:
                 results['ocr_print'] = True
-        except:
+        except Exception:
             pass
 
         return results

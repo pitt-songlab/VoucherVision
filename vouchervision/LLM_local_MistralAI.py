@@ -17,6 +17,7 @@ https://python.langchain.com/docs/integrations/llms/huggingface_pipelines
 '''
 
 class LocalMistralHandler:
+    _PIPELINE_CACHE = {}
     RETRY_DELAY = 2  # Wait 2 seconds before retrying
     MAX_RETRIES = 5  # Maximum number of retries
     STARTING_TEMP = 0.1
@@ -89,6 +90,15 @@ class LocalMistralHandler:
 
         self._build_model_chain_parser()
 
+    def _clear_gpu_memory(self):
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            try:
+                torch.cuda.ipc_collect()
+            except Exception:
+                pass
+
     def _adjust_config(self):
         new_temp = self.adjust_temp + self.temp_increment
         self.logger.info(f'Incrementing temperature from {self.adjust_temp} to {new_temp}')
@@ -99,6 +109,43 @@ class LocalMistralHandler:
         self.adjust_temp = self.starting_temp
 
     def _build_model_chain_parser(self):
+        if self.model_id in self.__class__._PIPELINE_CACHE:
+            self.logger.info(f"Reusing cached local Mistral pipeline for {self.model_id}")
+            self.local_model_pipeline = self.__class__._PIPELINE_CACHE[self.model_id]
+            self.local_model = HuggingFacePipeline(pipeline=self.local_model_pipeline)
+            self.retry_parser = RetryOutputParser.from_llm(
+                llm=self.local_model,
+                parser=self.parser,
+                max_retries=self.MAX_RETRIES,
+            )
+            self.chain = self.prompt | self.local_model
+            return
+
+        self._clear_gpu_memory()
+
+        if torch.cuda.is_available():
+            total = torch.cuda.get_device_properties(0).total_memory
+            free = torch.cuda.mem_get_info()[0]
+            used_ratio = (total - free) / total
+            if used_ratio > 0.75:
+                self.logger.warning(f"GPU memory is already {used_ratio:.1%} used before local Mistral load; forcing cleanup before model creation.")
+                gc.collect()
+                torch.cuda.empty_cache()
+                torch.cuda.ipc_collect()
+
+        model_kwargs = {
+            "torch_dtype": self.b_float_opt,
+            "quantization_config": self.bnb_config,
+            "low_cpu_mem_usage": True,
+            "device_map": "auto",
+        }
+
+        if torch.cuda.is_available():
+            total_vram = torch.cuda.get_device_properties(0).total_memory
+            safe_gpu_budget_gb = max(12, min(30, int(total_vram / (1024 ** 3) * 0.72)))
+            self.logger.warning(f"Local Mistral load is capped to ~{safe_gpu_budget_gb} GiB on GPU 0 to avoid OOM when Qwen is also resident.")
+            model_kwargs["max_memory"] = {0: f"{safe_gpu_budget_gb}GiB", "cpu": "64GiB"}
+
         self.local_model_pipeline = transformers.pipeline(
             "text-generation",
             model=self.model_id,
@@ -106,12 +153,17 @@ class LocalMistralHandler:
             top_k=self.config.get('top_k'),
             top_p=self.config.get('top_p'),
             do_sample=self.config.get('do_sample'),
-            model_kwargs={"torch_dtype": self.b_float_opt, "quantization_config": self.bnb_config},
+            model_kwargs=model_kwargs,
         )
+        self.__class__._PIPELINE_CACHE[self.model_id] = self.local_model_pipeline
         self.local_model = HuggingFacePipeline(pipeline=self.local_model_pipeline)
 
-        # Set up the retry parser with the runnable
-        self.retry_parser = RetryOutputParser(parser=self.parser, llm=self.local_model, max_retries=self.MAX_RETRIES)
+        # Create the retry parser using the current LangChain API contract.
+        self.retry_parser = RetryOutputParser.from_llm(
+            llm=self.local_model,
+            parser=self.parser,
+            max_retries=self.MAX_RETRIES,
+        )
         # Create an llm chain with LLM and prompt
         self.chain = self.prompt | self.local_model
 

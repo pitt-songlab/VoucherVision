@@ -1,4 +1,4 @@
-import random, os, base64, io, json, torch
+import random, os, base64, io, json, gc, torch
 from PIL import Image
 import copy
 import matplotlib.pyplot as plt  
@@ -19,6 +19,9 @@ except:
 warnings.filterwarnings("ignore", category=UserWarning, message="TypedStorage is deprecated")
 
 class Qwen2VLOCR:
+    _MODEL_CACHE = {}
+    _PROCESSOR_CACHE = {}
+
     def __init__(self, logger, model_id='Qwen/Qwen2-VL-7B-Instruct', ocr_text=None):
         self.PROMPT_OCR_ONLY_1 = """I cannot read the text in this image. Without explanation, please read me all of the text in this image."""
         self.PROMPT_OCR_ONLY_2 = """Perform OCR on this image. Return only the verbatim text without any explanation."""
@@ -107,6 +110,13 @@ Please populate the following JSON dictionary based on the rules and the unforma
         self.logger = logger
         self.model_id = model_id
 
+        if self.model_id in self.__class__._MODEL_CACHE:
+            self.logger.info(f"Reusing cached Qwen model for {self.model_id}")
+            self.model = self.__class__._MODEL_CACHE[self.model_id]
+            self.processor = self.__class__._PROCESSOR_CACHE[self.model_id]
+            self.monitor = SystemLoadMonitor(logger)
+            return
+
         self.monitor = SystemLoadMonitor(logger)
 
         try:
@@ -123,13 +133,44 @@ Please populate the following JSON dictionary based on the rules and the unforma
                     'and pip install "qwen-vl-utils" or click the Install Qwen button in the GUI.'
                 )
         
-        if self.model_id == 'Qwen/Qwen2-VL-7B-Instruct-AWQ':
-            self.model = Qwen2VLForConditionalGeneration.from_pretrained(self.model_id, torch_dtype=torch.float16, device_map="auto", revision="9d72ae62396aaa1817b006e07ddbbd121024f50d")
-        else:
-            self.model = Qwen2VLForConditionalGeneration.from_pretrained(self.model_id, torch_dtype=torch.float16, device_map="auto")
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
-        
+        safe_model_kwargs = {
+            "torch_dtype": torch.float16,
+            "device_map": "auto",
+            "low_cpu_mem_usage": True,
+        }
+
+        if torch.cuda.is_available():
+            total_vram = torch.cuda.get_device_properties(0).total_memory
+            safe_gpu_budget_gb = max(12, min(30, int(total_vram / (1024 ** 3) * 0.72)))
+            safe_model_kwargs["max_memory"] = {0: f"{safe_gpu_budget_gb}GiB", "cpu": "64GiB"}
+            self.logger.warning(f"Qwen load is capped to ~{safe_gpu_budget_gb} GiB on GPU 0 to allow the local Mistral model to coexist.")
+
+        if torch.cuda.is_available():
+            total = torch.cuda.get_device_properties(0).total_memory
+            free = torch.cuda.mem_get_info()[0]
+            used_ratio = (total - free) / total
+            if used_ratio > 0.75:
+                self.logger.warning(f"GPU memory is already {used_ratio:.1%} used before Qwen load; forcing cleanup before model creation.")
+                gc.collect()
+                torch.cuda.empty_cache()
+                torch.cuda.ipc_collect()
+
+        if self.model_id == 'Qwen/Qwen2-VL-7B-Instruct-AWQ':
+            self.model = Qwen2VLForConditionalGeneration.from_pretrained(
+                self.model_id,
+                revision="9d72ae62396aaa1817b006e07ddbbd121024f50d",
+                **safe_model_kwargs,
+            )
+        else:
+            self.model = Qwen2VLForConditionalGeneration.from_pretrained(self.model_id, **safe_model_kwargs)
+
         self.processor = AutoProcessor.from_pretrained(self.model_id, min_pixels=self.min_pixels, max_pixels=self.max_pixels)
+        self.__class__._MODEL_CACHE[self.model_id] = self.model
+        self.__class__._PROCESSOR_CACHE[self.model_id] = self.processor
 
     def encode_image_base64(self, image):
         """Encode the image to base64 format."""
